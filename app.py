@@ -263,11 +263,13 @@ def result(answer, srcs, scores, conf):
     return dict(answer=answer, sources=[int(i) for i in srcs], scores=[round(float(min(1, max(0, x))), 4) for x in scores],
                 confidence=round(float(conf), 4))
 
-def fill_sources(chosen, A, top_k, extra=None):
+def fill_sources(chosen, A, top_k, scores=None):
     ids = list(chosen) + [i for i in A.order if i not in chosen]
     ids = ids[:max(top_k, len(chosen))]
-    sc = sorted([(i, float(min(1.0, A.rank[i]))) for i in ids], key=lambda x: -x[1])
-    return [i for i, _ in sc], [x for _, x in sc]
+    sc = {i: float(min(1.0, A.rank[i])) for i in ids}
+    if scores: sc.update({i: float(min(1.0, v)) for i, v in scores.items()})
+    out = sorted(sc.items(), key=lambda x: -x[1])
+    return [i for i, _ in out], [v for _, v in out]
 
 def answer_synth(q, top_k, dbg):
     stmts = []
@@ -275,15 +277,16 @@ def answer_synth(q, top_k, dbg):
         if not sent.strip() or re.match(r"\s*how (do|are|does|can) (both|these|they|the two)", sent, re.I): continue
         s2 = re.sub(r"^[^:]{0,110}:\s*", "", sent).strip()
         if s2: stmts.append(s2)
-    chosen = []
+    chosen, own, A0 = [], {}, None
     for st in stmts[:4]:
-        A = analyze(st)
+        A = analyze(st); A0 = A0 or A
         for i in A.order:
-            if i not in chosen: chosen.append(i); break
-    Aq = analyze(" ".join(stmts) or q)
-    for i in Aq.order:
-        if len(chosen) >= 2: break
-        if i not in chosen: chosen.append(i)
+            if i not in chosen: chosen.append(i); own[i] = A.rank[i]; break
+    if len(chosen) < 2:
+        Aq = analyze(" ".join(stmts) or q); A0 = A0 or Aq
+        for i in Aq.order:
+            if len(chosen) >= 2: break
+            if i not in chosen: chosen.append(i); own[i] = Aq.rank[i]
     parts = []
     for i in chosen:
         j = next((j for j in range(1, len(SENTS[i])) if HASNUM.search(SENTS[i][j])), 0)
@@ -291,7 +294,7 @@ def answer_synth(q, top_k, dbg):
         parts.append(f"{NAME[i]}: {first}. {SENTS[i][j].rstrip('.')}." if j else f"{NAME[i]}: {first}.")
     names = " and ".join(NAME[i] for i in chosen)
     answer = " ".join(parts) + f" Integration: {names} are complementary approaches in the same area; each passage above gives the parameters and behavior of its own mechanism."
-    srcs, sc = fill_sources(chosen, Aq, top_k)
+    srcs, sc = fill_sources(chosen, A0, top_k, own)
     dbg.update(statements=stmts, chosen=chosen, decision="answer (synthesis template)")
     return result(answer, srcs, sc, 0.9), dbg
 
@@ -316,6 +319,13 @@ def answer_query(question: str, top_k: int):
     chosen = multi if multi else [top]
     top = chosen[0]
     numeric_q = bool(NUMQ.search(body))
+    false_prem = None
+    if prem:
+        pnums = set(re.findall(r"\d+(?:\.\d+)?", _NAMEDIG.sub(" ", prem)))
+        kbnums = set()
+        for i in (list(A.ents) or [top]):
+            kbnums |= set(re.findall(r"\d+(?:\.\d+)?", _NAMEDIG.sub(" ", KB[i])))
+        if pnums - kbnums: false_prem = sorted(pnums - kbnums)
     unk = unknown_proper(q)
     j, fcov = pick_sentence(top, A)
     dbg.update(entities={int(i): NAME[i] for i in A.ents}, numeric_q=numeric_q, unknown=unk, facet_cov=round(fcov, 3),
@@ -323,7 +333,8 @@ def answer_query(question: str, top_k: int):
                top5=[dict(id=i, rank=round(float(A.rank[i]), 3), lexP=round(float(A.lexP[i]), 3), lexS=round(float(A.lexS[i]), 3),
                           dense=None if A.dP is None else round(float(A.dP[i]), 3)) for i in A.order[:5]])
     reason = None
-    if unk and not multi: reason = f"unknown entity {unk}"
+    if false_prem: reason = f"false premise: {false_prem} not supported by the knowledge base"
+    elif unk and not multi: reason = f"unknown entity {unk}"
     elif not multi and numeric_q:
         if fcov < ABSTAIN_FCOV: reason = f"facet coverage {fcov:.2f} < {ABSTAIN_FCOV}"
         elif not HASNUM.search(SENTS[top][j]): reason = "numeric question but best sentence has no value"
@@ -385,7 +396,10 @@ async def query(body: Q):
 def health(): return {"ok": True, "dense": ENC is not None, "passages": N, "logged": len(LOGS)}
 
 @app.get("/logs")
-def logs(n: int = 100): return list(LOGS)[-n:]
+def logs(n: int = 100, compact: bool = False):
+    rows = list(LOGS)[-n:]
+    if not compact: return rows
+    return [{k: r.get(k) for k in ("ts", "q", "decision", "answer", "sources", "conf", "ms", "premise_ignored", "entities")} for r in rows]
 
 @app.get("/debug")
 def debug(q: str, top_k: int = 3):
