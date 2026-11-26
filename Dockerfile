@@ -1,5 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 # CPU-only torch keeps the image and RAM footprint much smaller
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
